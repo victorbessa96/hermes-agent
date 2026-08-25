@@ -6333,7 +6333,6 @@ class AIAgent:
     ) -> None:
         from agent.auxiliary_client import (
             _AI_GATEWAY_HEADERS,
-            build_nvidia_nim_headers,
             build_or_headers,
         )
 
@@ -6341,8 +6340,6 @@ class AIAgent:
             self._client_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
-        elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-            self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
