@@ -826,7 +826,7 @@ _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
+    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"], actor=a.get("actor") or "cronjob_tool")),
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
 }
 
@@ -866,6 +866,7 @@ def cronjob(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
+    actor: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     continuity: Optional[bool] = None,

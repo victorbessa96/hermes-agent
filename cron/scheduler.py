@@ -214,6 +214,38 @@ def _log_tick_yield_once(reason: str) -> None:
     _last_yield_log = {"reason": reason, "at": now}
 
 
+_croniter_missing_warned = False
+
+
+def _warn_once_if_croniter_missing() -> None:
+    """Loud-once probe for the croniter-absent silent-degradation class.
+
+    Several tick-path seams degrade silently when croniter is not importable:
+    ``_fire_claim_ttl_for_job`` collapses to the flat 300s floor, cadence/grace
+    probes report "unknown", and ``_job_is_stale_error_recurring`` falls back to
+    grace-only math. None of those log. The loud errors (schedule validation,
+    ``compute_next_run``) only fire at job-edit / per-job fire time, so a broken
+    runtime venv would otherwise stay invisible until a claim fight or a missed
+    re-arm surfaces it. One warning per process is enough: the state doesn't
+    change at runtime.
+    """
+    global _croniter_missing_warned
+    if _croniter_missing_warned:
+        return
+    try:
+        from cron.jobs import _ensure_croniter
+        if not _ensure_croniter():
+            _croniter_missing_warned = True
+            logger.warning(
+                "croniter is not importable in this runtime — claim TTL, cadence, "
+                "and stale-error rearm are running on degraded flat-floor values. "
+                "croniter is a core dependency; reinstall hermes-agent or "
+                "'pip install croniter' in this venv.")
+    except Exception:
+        # Never let the probe break the tick.
+        _croniter_missing_warned = True
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Compact one-line failure message for chat delivery (full details stay in cron output)."""
     job_name = job.get("name") or job.get("id") or "cron job"
@@ -3177,6 +3209,17 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
     )
     if scoped_command == command:
+        # Not a managed-systemd gateway: restart_safe_gateway_child_argv handed the
+        # command back unchanged, so run_one_job resumes in-process execution. Log
+        # it — the job then runs on the ticker's stack, due-scan is blocked for its
+        # full duration, and nothing distinguishes that from a true scoped worker in
+        # the logs unless we say so here.
+        logger.info(
+            "Cron job '%s' executing in-process (execution=%s): no restart-safe "
+            "systemd scope applies to this topology",
+            job_id,
+            execution_id,
+        )
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
@@ -3782,6 +3825,7 @@ def tick(
         return 0
 
     try:
+        _warn_once_if_croniter_missing()
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
         with contextlib.suppress(ImportError):
             from agent.estop import check_paused as _estop_check_paused

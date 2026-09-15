@@ -338,7 +338,7 @@ def _block_and_pause_job(
     from cron.jobs import pause_job
     logger.error("Job '%s': %s", job_id, reason)
     try:
-        pause_job(job_id, f"Auto-paused by scheduler: {reason}")
+        pause_job(job_id, f"Auto-paused by scheduler: {reason}", actor="scheduler")
     except Exception:
         logger.exception("Job '%s': failed to auto-pause unrunnable job", job_id)
 

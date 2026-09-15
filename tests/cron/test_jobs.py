@@ -484,6 +484,34 @@ class TestPauseResumeJob:
         assert paused["paused_reason"] == "user paused"
         assert paused.get("paused_at")
 
+    def test_pause_stamps_actor_via_paused_via(self, tmp_cron_dir):
+        """Invariant: an un-actor'd pause still trails as 'unknown'; an actor'd pause
+        records the surface, and resume clears the stamp."""
+        job = create_job(prompt="Stamp me", schedule="every 1h")
+
+        auto = pause_job(job["id"], reason="unattributed")
+        assert auto["paused_via"] == "unknown"
+
+        cli = pause_job(job["id"], reason="cli", actor="cli")
+        assert cli["paused_via"] == "cli"
+
+        resumed = resume_job(job["id"])
+        assert resumed["paused_via"] is None
+        assert resumed["paused_reason"] is None
+
+    def test_pause_tool_distinguishes_cli_from_agent(self, tmp_cron_dir):
+        """Invariant: the cronjob tool stamps an agent-initiated pause as 'cronjob_tool'
+        and a CLI-initiated pause as 'cli', so forensics can tell the surfaces apart."""
+        import json
+        from tools.cronjob_tools import cronjob
+        job = create_job(prompt="Stamp the surface", schedule="every 1h")
+
+        agent = json.loads(cronjob(action="pause", job_id=job["id"], reason="tool pause"))
+        assert agent["job"]["paused_via"] == "cronjob_tool"
+
+        cli = json.loads(cronjob(action="pause", job_id=job["id"], reason="cli pause", actor="cli"))
+        assert cli["job"]["paused_via"] == "cli"
+
     def test_pause_is_authoritative_due_jobs_do_not_fire(self, tmp_cron_dir):
         """Behavioural invariant: after pause, a past-due job must not be due.
 

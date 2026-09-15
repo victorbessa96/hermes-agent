@@ -142,7 +142,10 @@ class TestFutureDatedClaims:
         jobs = load_jobs()
         for j in jobs:
             if j["id"] == job["id"]:
-                past = jobs_mod._hermes_now() - timedelta(hours=6)
+                # Period-aware TTL for daily-at-7am is 2*86400 = 172800s (~48h).
+                # Stamp the claim far past that to mean "stale for any schedule":
+                # 8 days → past even the daily TTL multiplied.
+                past = jobs_mod._hermes_now() - timedelta(days=8)
                 j["fire_claim"] = {"at": past.isoformat(), "by": "other-host:1"}
         save_jobs(jobs)
         assert claim_job_for_fire(job["id"]) is True

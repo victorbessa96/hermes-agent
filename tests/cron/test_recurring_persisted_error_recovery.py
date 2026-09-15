@@ -187,7 +187,9 @@ class TestPersistedStaleErrorRecovery:
             "re-armed by stale-error recovery"
         )
 
-        # Once the foreign claim has expired (owner died), recovery resumes.
-        expired = (now - timedelta(seconds=J.FIRE_CLAIM_TTL_SECONDS + 1)).isoformat()
+        # Once the foreign claim has expired (owner died), recovery resumes. Expiry is
+        # measured against the job's own period-aware TTL, not the flat floor.
+        ttl = J._fire_claim_ttl_for_job(job["schedule"])
+        expired = (now - timedelta(seconds=ttl + 1)).isoformat()
         J.update_job(job_id, {"fire_claim": {"at": expired, "by": "other-host:deadbeef"}})
         assert J._job_is_stale_error_recurring(J.get_job(job_id), job["schedule"], now)

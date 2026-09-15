@@ -144,8 +144,12 @@ def test_reclaimed_fire_uses_new_owner_token(temp_home, monkeypatch):
     monkeypatch.setattr(
         jobs,
         "_hermes_now",
-        lambda: original_at + timedelta(seconds=301),
+        # Period-aware TTL for every-5m is 600s (max(300, 2*300)); step past it so
+        # the claim is stale on TTL alone, then report the owner pid dead so the
+        # probe's grace window doesn't defer reclaim (the crashed-worker case).
+        lambda: original_at + timedelta(seconds=601),
     )
+    monkeypatch.setattr(jobs, "_pid_alive", lambda *a, **k: False)
 
     assert jobs.claim_job_for_fire(job["id"]) is True
     replacement = dict(jobs.get_job(job["id"])["fire_claim"])
@@ -263,3 +267,135 @@ def test_same_thread_fire_fence_reentrancy_preserves_ownership(temp_home):
     assert result == {"outer": True, "inner": True}
     thread.join(timeout=2)
     assert thread.is_alive() is False
+
+
+def test_expired_claim_with_live_owner_pid_defers_reclaim(temp_home, monkeypatch):
+    """A claim aged past the base 300s TTL whose owner pid is still alive on this
+    host is NOT reclaimed yet (bounded grace up to 2x TTL). This protects a
+    slow-but-alive run from being double-fired when claim_ttl equals the job
+    period (the */5 stall case).
+
+    With the period-aware TTL, a 301s-old claim on an every-5m job is still inside
+    the plain TTL (max(300, 2*300) = 600) — no pid probe needed. The pid probe
+    then guards the 600s→1200s window. Test the same shape a longer-period job
+    exercises: 301s is past the base TTL, before the period-aware TTL binds."""
+    from datetime import datetime, timedelta
+
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="live-owner")
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    original = dict(jobs.get_job(job["id"])["fire_claim"])
+    original_at = datetime.fromisoformat(original["at"])
+    monkeypatch.setattr(
+        jobs,
+        "_hermes_now",
+        lambda: original_at + timedelta(seconds=301),  # past 300s base TTL
+    )
+    # Owner pid (= this test process) is genuinely alive; no monkeypatch needed.
+
+    # Reclaim must be refused while the owner is alive within the grace window.
+    assert jobs.claim_job_for_fire(job["id"]) is False
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] == original["by"]
+
+
+def test_expired_claim_with_dead_owner_pid_is_reclaimed(temp_home, monkeypatch):
+    """The crash-reclaim behavior must be preserved: past the period-aware TTL plus
+    a dead owner pid still reclaims exactly as before (no wedge from a crashed
+    worker). For every-5m the TTL is 600s (max(300, 2*300)), so 601s is stale."""
+    from datetime import datetime, timedelta
+
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="dead-owner")
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    original = dict(jobs.get_job(job["id"])["fire_claim"])
+    original_at = datetime.fromisoformat(original["at"])
+    monkeypatch.setattr(
+        jobs,
+        "_hermes_now",
+        lambda: original_at + timedelta(seconds=601),
+    )
+    monkeypatch.setattr(jobs, "_pid_alive", lambda *a, **k: False)
+
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] != original["by"]
+
+
+def test_live_owner_pid_past_grace_window_reclaims(temp_home, monkeypatch):
+    """Even a live owner cannot hold past 2x the period-aware TTL: the grace window
+    is bounded so a wedged (zombie-with-live-pid, heartbeat-starved) worker
+    eventually loses. For every-5m, TTL = 600s and grace = 2 * 600 = 1200s."""
+    from datetime import datetime, timedelta
+
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="grace-expired")
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    original_at = datetime.fromisoformat(jobs.get_job(job["id"])["fire_claim"]["at"])
+    monkeypatch.setattr(
+        jobs,
+        "_hermes_now",
+        lambda: original_at + timedelta(seconds=1201),  # past 2x 600s TTL
+    )
+    # Owner alive, but past the grace bound — reclaim proceeds.
+    assert jobs.claim_job_for_fire(job["id"]) is True
+
+
+def test_pid_probe_helper_unit_behaviour():
+    """The pid probe itself: live self-pid, impossible pid, garbage owner string."""
+    import os
+    from datetime import datetime, timedelta, timezone
+
+    import cron.jobs as jobs
+
+    now = datetime.now(timezone.utc)
+    at = (now - timedelta(seconds=400)).isoformat()
+
+    # Live same-host pid within grace -> live
+    live_by = f"{jobs._machine_id()}:deadbeef"
+    assert jobs._claim_is_live_with_pid_probe({"at": at, "by": live_by}, now, 300) is True
+
+    # Garbage by-strings fall through to TTL-only -> stale
+    for bad in ("no-colons", "host:notapid:uuid", "", 12345, None):
+        assert jobs._claim_is_live_with_pid_probe({"at": at, "by": bad}, now, 300) is False
+
+    # A pid that cannot exist fails liveness; our own pid lives.
+    assert jobs._pid_alive(2**22) is False
+    assert jobs._pid_alive(os.getpid()) is True
+
+
+def test_period_aware_ttl_short_period_uses_two_x_period():
+    """``_fire_claim_ttl_for_job`` shapes per schedule: */5 → 600; every 15m →
+    floor 300 (2*900 > 300, so 1800); 3am daily → 2 * 86400; unknown → floor."""
+    import cron.jobs as jobs
+
+    assert jobs._fire_claim_ttl_for_job({"kind": "interval", "minutes": 5}) == 600
+    assert jobs._fire_claim_ttl_for_job({"kind": "interval", "minutes": 15}) == 1800
+    assert jobs._fire_claim_ttl_for_job({"kind": "interval", "minutes": 1}) == 300
+    # Unknown cadence falls back to the flat floor.
+    assert jobs._fire_claim_ttl_for_job({"kind": "once", "run_at": "2026-09-12T03:00:00"}) == 300
+    assert jobs._fire_claim_ttl_for_job(None) == 300
+
+
+def test_short_period_job_stale_at_past_base_ttl_still_blocks_reclaim(temp_home, monkeypatch):
+    """The */5 stall race the patch closes: claim at T=0, clock at T=301s. Without
+    the period-aware TTL (plain 300s) a crashed pid would reclaim; with it, the
+    TTL is 600s so the claim is merely "within the pid-probe grace window" and
+    only a dead-pid probe should allow reclaim.
+
+    Live pid + 301s => reclaim refused (TTL not yet expired)."""
+    from datetime import datetime, timedelta
+
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="stall-shield")
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    original_at = datetime.fromisoformat(jobs.get_job(job["id"])["fire_claim"]["at"])
+    monkeypatch.setattr(
+        jobs,
+        "_hermes_now",
+        lambda: original_at + timedelta(seconds=301),
+    )
+    # Live pid (this test process). The reclaim must be refused.
+    assert jobs.claim_job_for_fire(job["id"]) is False

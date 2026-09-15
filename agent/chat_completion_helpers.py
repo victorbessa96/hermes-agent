@@ -612,6 +612,21 @@ def _cloud_stale_timeout(base: float, api_kwargs: dict) -> float:
     return timeout if floor is None else max(timeout, floor)
 
 
+def _acquire_global_rate_limit(agent) -> None:
+    """Gate one outbound call through the cross-process token bucket.
+
+    Centralised so every request-helper that runs pre-HTTP pauses on the
+    shared SQLite-backed limiter.  Soft optimisation: any failure is
+    swallowed because rate limiting must never block a call.
+    """
+    try:
+        provider = getattr(agent, "provider", None) or "unknown"
+        from agent.rate_limiter import _acquire_rate_token
+        _acquire_rate_token(str(provider))
+    except Exception:
+        pass
+
+
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Stale-stream patience for a provider that is never a local endpoint (Bedrock):
     the OpenAI/Anthropic stale detector's budget minus its local branch."""
@@ -919,6 +934,7 @@ def direct_api_call(agent, api_kwargs: dict):
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
     _check_stale_giveup(agent)
+    _acquire_global_rate_limit(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
     # (fail-closed), and a leaked heartbeat thread would mask real stalls forever.

@@ -760,7 +760,7 @@ def _cron_pause(_engine: HermesConsoleEngine, args: list[str]) -> str:
     from cron.jobs import pause_job
     return _cron_job_action(
         args, "cron pause <job>", "Paused",
-        lambda ref: pause_job(ref, reason="paused from hermes console"))
+        lambda ref: pause_job(ref, reason="paused from hermes console", actor="console"))
 
 
 def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:

@@ -892,6 +892,23 @@ FIRE_CLAIM_TTL_SECONDS = 300
 _persisted_error_recoveries_recent: list = []
 
 
+def _fire_claim_ttl_for_job(schedule: Any) -> int:
+    """Period-aware claim TTL for ``claim_job_for_fire``.
+
+    The flat 300s TTL equals the */5 job period, so a stall past one tick was a
+    steal-on-next-tick race (2026-09-05 03:07/03:12 ownership-lost warnings). Scale the
+    TTL with the schedule so the nominal path of a short-period job never expires its
+    claim mid-run: ``max(FIRE_CLAIM_TTL_SECONDS, 2 * period)``. Unknown cadence keeps
+    the floor; the pid-probe grace window in ``_claim_is_live_with_pid_probe`` stays
+    relative to whatever TTL this returns.
+    """
+    try:
+        cadence = _schedule_cadence_seconds(schedule) or 0.0
+    except Exception:
+        cadence = 0.0
+    return int(max(float(FIRE_CLAIM_TTL_SECONDS), 2.0 * float(cadence)))
+
+
 def _job_is_stale_error_recurring(
     job: Dict[str, Any], schedule: Dict[str, Any], now: datetime,
 ) -> bool:
@@ -911,7 +928,10 @@ def _job_is_stale_error_recurring(
         return False
     # A fresh fire_claim means the job is running in ANOTHER process sharing this
     # store, not wedged; re-arming it here would only claim-fight the live run.
-    if _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
+    # fresh claim check must use the same period-aware TTL claim_job_for_fire granted the
+    # owner; a flat floor shorter than that TTL would re-arm under a claim its owner
+    # still considers live (mirror of the 2026-09-11 period-aware fix at the reclaim seam).
+    if _claim_is_live(job.get("fire_claim"), now, _fire_claim_ttl_for_job(schedule)):
         return False
     last_run = job.get("last_run_at")
     last_run_dt = _parse_aware(last_run) if last_run else None
@@ -1970,8 +1990,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return _with_job(job_id, apply)
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+def pause_job(job_id: str, reason: Optional[str] = None,
+              actor: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    ``actor`` stamps which surface initiated the pause (``cli``, ``console``,
+    ``dashboard``, ``cronjob_tool``, ``scheduler``) into ``paused_via`` so forensics can
+    distinguish auto-pauses from user-originated pauses and each UI from the others. A
+    caller that omits it still gets a non-null trail (``unknown``)."""
     job = resolve_job_ref(job_id)
     if not job:
         return None
@@ -1980,6 +2006,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
+        "paused_via": actor or "unknown",
     })
 
 
@@ -1999,6 +2026,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
+        "paused_via": None,
         "next_run_at": next_run_at,
     })
 
@@ -2021,6 +2049,7 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
+        "paused_via": None,
         "next_run_at": manual_run_at,
         # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
         "manual_run_at": manual_run_at,
@@ -2035,6 +2064,71 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
         return False
     claimed_at = _parse_aware(claim["at"])
     return claimed_at is not None and 0 <= (now - claimed_at).total_seconds() < ttl_seconds
+
+
+def _pid_alive(pid: int, host_hint: str = "") -> bool:
+    """True iff ``pid`` is a live process on THIS host. Same-store claim owners are
+    same-Host OS processes; when ``host_hint`` (the claim-owner host part) is set and
+    disagrees with our hostname we conservatively answer False (can't see remote pids,
+    so the bare TTL decides, preserving churn on multi-host stores).
+    PID-reuse trick: the probe only defers a reclaim — never extends a claim — so a
+    recycled pid at worst extends the finite stall-grace window by TTL, never wedge."""
+    if pid <= 0:
+        return False
+    if host_hint and host_hint != "unknown":
+        try:
+            import socket
+            if host_hint != socket.gethostname():
+                return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another uid
+    except OSError:
+        return False
+    return True
+
+
+def _claim_is_live_with_pid_probe(
+    claim: Any, now: datetime, ttl_seconds: float, *, grace_ttl_seconds: Optional[float] = None,
+) -> bool:
+    """TTL liveness, plus a bounded defer: a claim aged within ``[0, grace_ttl)`` whose
+    owner pid is still alive on this host counts as live even past the base TTL.
+
+    Why: ``claim_job_for_fire``'s 300s TTL equals the */5 job period, so a run that
+    stalls mid-pipeline (still alive, no crash) has its claim stolen on the next tick —
+    double-fire while the original still runs (observed 2026-09-05: ownership-lost
+    warnings on a */5 job with claim.at only ~2 ticks old). Heartbeat cadence is 60s so
+    a claim past 2×TTL without refresh is genuinely wedged or heartbeat-starved; the
+    pid probe is the safety net window in between. Crash reclamation still lands at the
+    same age as before (dead pid fails the probe on the first expired-claim check).
+    """
+    if _claim_is_live(claim, now, ttl_seconds):
+        return True
+    # Past the base TTL: only the pid probe can keep it alive.
+    if not isinstance(claim, dict) or not claim.get("at") or not claim.get("by"):
+        return False
+    claimed_at = _parse_aware(claim["at"])
+    grace = grace_ttl_seconds if grace_ttl_seconds is not None else 2 * ttl_seconds
+    if claimed_at is None or not (0 <= (now - claimed_at).total_seconds() < grace):
+        return False
+    # claim['by'] = f"{host}:{pid}:{uuid}" — split from the right to survive hostnames
+    # that themselves contain colons.
+    parts = str(claim["by"]).rsplit(":", 2)
+    if len(parts) != 3:
+        return False
+    host_part, pid_str = parts[0], parts[1]
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return False
+    if _pid_alive(pid, host_part):
+        return True
+    return False
 
 
 _REARM_RECURRING_ERROR = (
@@ -2491,16 +2585,23 @@ def _machine_id() -> str:
 
 
 def claim_job_for_fire(
-    job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False, return_job: bool = False,
+    job_id: str, *, claim_ttl_seconds: Optional[int] = None, force: bool = False, return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
     fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
     fire, which also resumes the job atomically; external callbacks must leave it false so a
-    stale callback cannot resurrect a paused job). Lose if a claim younger than
-    ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
-    clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    stale callback cannot resurrect a paused job). Lose if a claim younger than the TTL exists
+    (the TTL lets another fire reclaim after a crash; mark_job_run clears the claim). Otherwise
+    stamp ``fire_claim`` and, for recurring jobs, advance ``next_run_at`` so a stale
+    re-delivery cannot re-fire.
+
+    ``claim_ttl_seconds=None`` (the default) resolves per-job to
+    ``_fire_claim_ttl_for_job(job['schedule'])``: ``max(FIRE_CLAIM_TTL_SECONDS,
+    2 * period)`` — a */5 job's nominal path then never lets its own claim expire
+    mid-run while a stalled run's pid remains probe-alive past it. An explicit int
+    overrides (tests, operators).
+    """
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2509,8 +2610,13 @@ def claim_job_for_fire(
         if not force and not is_job_runnable(job):
             return False
         now = _hermes_now()
-        if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
-            return False  # someone holds a fresh claim
+        ttl = (
+            claim_ttl_seconds
+            if claim_ttl_seconds is not None
+            else _fire_claim_ttl_for_job(job.get("schedule"))
+        )
+        if _claim_is_live_with_pid_probe(job.get("fire_claim"), now, ttl):
+            return False  # someone holds a fresh claim (or a live but slow one)
         from cron.occurrences import completed_occurrence, scheduled_instant
 
         manual = force or job.get("manual_run_at") == job.get("next_run_at")

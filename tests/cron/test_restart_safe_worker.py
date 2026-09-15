@@ -328,6 +328,32 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     popen.assert_not_called()
 
 
+def test_in_process_fallback_is_logged(monkeypatch, caplog):
+    """The in-process fallback is silent by design failure: outside a managed
+    systemd gateway the job runs on the ticker thread, blocking due-scan for its
+    whole duration. There must be a visible INFO signal naming job + execution."""
+    import logging
+
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, *, unit_suffix: command,
+    )
+
+    with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+        assert scheduler._launch_external_cron_worker(
+            {"id": "job-1", "execution_id": "exec-1"}
+        ) is False
+
+    assert any(
+        "in-process" in record.getMessage()
+        and "job-1" in record.getMessage()
+        and "exec-1" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
     import cron.scheduler as scheduler
 
